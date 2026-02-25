@@ -203,11 +203,21 @@ def get_self_info(current_user: Dict[str, Any] = Depends(get_current_user_info))
     username = current_user["username"]
     conn = get_db()
     cursor = conn.cursor(pymysql.cursors.DictCursor)
+    # 修正后的完整 SQL 查询代码
+    # 修正后的 SQL 查询（添加 weapons 及其他需要的字段）
     cursor.execute("""
-        SELECT u.username, p.level, p.maxHp, p.gold, p.win_count, p.lose_count,
-               p.weapons, p.skills, p.dressing
-        FROM players p
-        JOIN user_accounts u ON p.account_id = u.id
+        SELECT 
+            u.username, 
+            p.level, 
+            p.maxHp, 
+            p.gold, 
+            p.win_count, 
+            p.lose_count,
+            p.weapons,
+            p.skills,
+            p.dressing
+        FROM user_accounts u
+        JOIN players p ON u.id = p.account_id
         WHERE u.username = %s
     """, (username,))
     player = cursor.fetchone()
@@ -381,4 +391,4 @@ def admin_batch_update(data: AdminBatchUpdate, _=Depends(is_admin)):
 # ---------------------- 启动服务 ----------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8009)
