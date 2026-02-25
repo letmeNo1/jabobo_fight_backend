@@ -13,11 +13,11 @@ from typing import Optional, List, Dict, Any
 load_dotenv()
 app = FastAPI(title="乐斗游戏 - 管理员批量修改版", version="1.0")
 
-# CORS（解决前端跨域）
+# CORS（解决前端跨域）- 核心修改：替换通配符为具体前端域名
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 内部测试允许所有来源
+    allow_origins=["http://localhost:3000", "http://localhost:7000"],  # 新增7000端口
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -278,6 +278,29 @@ def update_self_info(data: PlayerSelfUpdate, current_user: Dict[str, Any] = Depe
     finally:
         cursor.close()
         conn.close()
+
+@app.get("/player/all", summary="普通用户查看所有玩家的基础数据")
+def get_all_players_for_player(current_user: Dict[str, Any] = Depends(get_current_user_info)):
+    """普通用户（无需管理员权限）查看全服所有玩家的基础数据，返回格式与管理员接口一致"""
+    conn = get_db()
+    cursor = conn.cursor(pymysql.cursors.DictCursor)
+    cursor.execute("""
+        SELECT u.username, p.level, p.maxHp, p.gold, p.win_count, p.lose_count,
+               p.weapons, p.skills, p.dressing
+        FROM players p
+        JOIN user_accounts u ON p.account_id = u.id
+        ORDER BY p.level DESC, p.win_count DESC
+    """)
+    players = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    # 解析JSON字段（与管理员接口逻辑完全一致）
+    for p in players:
+        p["weapons"] = json.loads(p["weapons"]) if p["weapons"] else []
+        p["skills"] = json.loads(p["skills"]) if p["skills"] else []
+        p["dressing"] = json.loads(p["dressing"]) if p["dressing"] else {}
+    return {"code": 200, "data": players}
 
 # ---------------------- 3. 管理员专属接口（批量修改任意玩家） ----------------------
 @app.get("/admin/players/all", summary="管理员查看所有玩家")
