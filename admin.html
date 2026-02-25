@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>乐斗游戏 - 管理员后台（搜索+加载+勾选）</title>
+    <link href="https://cdn.bootcdn.net/ajax/libs/twitter-bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .hidden { display: none; }
+        .card { margin-bottom: 20px; }
+        .container { max-width: 1200px; margin: 20px auto; }
+        .alert { margin-top: 10px; }
+        .checkbox-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin: 10px 0;
+            padding: 10px;
+            border: 1px solid #eee;
+            border-radius: 6px;
+        }
+        .checkbox-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            padding: 4px 8px;
+            background: #f8f9fa;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        .group-title {
+            font-weight: bold;
+            margin-top: 12px;
+            color: #0d6efd;
+            width: 100%;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <!-- 登录 -->
+    <div id="login-section" class="card p-4">
+        <h3 class="text-center mb-4">管理员登录</h3>
+        <div class="mb-3">
+            <label class="form-label">用户名</label>
+            <input type="text" id="login-username" class="form-control">
+        </div>
+        <div class="mb-3">
+            <label class="form-label">密码</label>
+            <input type="password" id="login-password" class="form-control">
+        </div>
+        <button id="login-btn" class="btn btn-primary w-100">登录</button>
+        <div id="login-alert" class="alert hidden"></div>
+    </div>
+
+    <!-- 管理员面板 -->
+    <div id="admin-section" class="hidden">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <h3>管理员后台</h3>
+            <div>
+                <span class="badge bg-danger">管理员</span>
+                <button id="logout-btn" class="btn btn-outline-danger ms-2">退出</button>
+            </div>
+        </div>
+
+        <!-- 搜索玩家 -->
+        <div class="card p-3 mb-3">
+            <h5>玩家搜索</h5>
+            <div class="d-flex gap-2">
+                <input type="text" id="search-username" class="form-control" placeholder="输入用户名搜索">
+                <button id="search-btn" class="btn btn-outline-primary">搜索</button>
+                <button id="load-all-btn" class="btn btn-outline-secondary">显示全部</button>
+            </div>
+        </div>
+
+        <!-- 玩家列表 -->
+        <div class="card p-3 mb-3">
+            <h5>玩家列表</h5>
+            <div id="player-list" class="mt-2" style="max-height:300px;overflow-y:auto;">加载中...</div>
+        </div>
+
+        <!-- 批量修改表单 -->
+        <div class="card p-3">
+            <h5>修改玩家数据</h5>
+            <div class="mb-2">
+                <label class="form-label">目标用户名</label>
+                <input type="text" id="target-user" class="form-control" readonly placeholder="点击列表加载">
+            </div>
+
+            <div class="row g-2 mb-2">
+                <div class="col-md-2">
+                    <label class="form-label">等级</label>
+                    <input type="number" id="edit-level" class="form-control">
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">血量</label>
+                    <input type="number" id="edit-hp" class="form-control">
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">金币</label>
+                    <input type="number" id="edit-gold" class="form-control">
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">胜场</label>
+                    <input type="number" id="edit-win" class="form-control">
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">负场</label>
+                    <input type="number" id="edit-lose" class="form-control">
+                </div>
+            </div>
+
+            <!-- 武器 -->
+            <div>
+                <label class="form-label group-title">武器</label>
+                <div id="weapon-checks" class="checkbox-group"></div>
+            </div>
+
+            <!-- 技能 -->
+            <div>
+                <label class="form-label group-title">技能</label>
+                <div id="skill-checks" class="checkbox-group"></div>
+            </div>
+
+            <!-- 装扮 -->
+            <div>
+                <label class="form-label group-title">装扮</label>
+                <div id="dress-checks" class="checkbox-group"></div>
+            </div>
+
+            <button id="save-btn" class="btn btn-warning mt-3">保存修改</button>
+            <div id="save-alert" class="alert hidden mt-2"></div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.bootcdn.net/ajax/libs/twitter-bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
+<script>
+const API = "http://localhost:8000";
+let token = localStorage.getItem("token");
+let role  = localStorage.getItem("role");
+let username = localStorage.getItem("username");
+
+// 配置数据
+const WEAPONS = [
+  { id: 'w1', name: '方天画戟', type: 'LARGE' },{ id: 'w2', name: '三叉戟', type: 'LARGE' },
+  { id: 'w3', name: '充气锤子', type: 'LARGE' },{ id: 'w4', name: '开山斧', type: 'LARGE' },
+  { id: 'w5', name: '青龙偃月刀', type: 'LARGE' },{ id: 'w6', name: '狂魔镰', type: 'LARGE' },
+  { id: 'w7', name: '棒球棒', type: 'LARGE' },{ id: 'w8', name: '木槌', type: 'LARGE' },
+  { id: 'w9', name: '红缨枪', type: 'MEDIUM' },{ id: 'w10', name: 'kick', type: 'MEDIUM' },
+  { id: 'w11', name: '双截棍', type: 'MEDIUM' },{ id: 'w12', name: '蛇影弓', type: 'MEDIUM' },
+  { id: 'w13', name: '平底锅', type: 'MEDIUM' },{ id: 'w14', name: '宽刃剑', type: 'MEDIUM' },
+  { id: 'w15', name: '木剑', type: 'SMALL' },{ id: 'w16', name: '短剑', type: 'SMALL' },
+  { id: 'w17', name: '判官笔', type: 'SMALL' },{ id: 'w18', name: '流星球', type: 'SMALL' },
+  { id: 'w19', name: '老鼠', type: 'SMALL' },{ id: 'w20', name: '板砖', type: 'SMALL' },
+  { id: 'w21', name: 'speaker310', type: 'THROW' },{ id: 'w22', name: '接力棒', type: 'THROW' },
+  { id: 'w23', name: '胶水(瓶)', type: 'THROW' },{ id: 'w24', name: '仙人掌', type: 'THROW' },
+];
+
+const SKILLS = [
+  { id: 's1', name: '天生大力', category: 'BASE_STAT' },{ id: 's2', name: '身手敏捷', category: 'BASE_STAT' },
+  { id: 's3', name: '快人一步', category: 'BASE_STAT' },{ id: 's4', name: '强健身躯', category: 'BASE_STAT' },
+  { id: 's5', name: '均衡发展', category: 'BASE_STAT' },{ id: 's6', name: '武器好手', category: 'PASSIVE' },
+  { id: 's7', name: '肉搏好手', category: 'PASSIVE' },{ id: 's8', name: '第六感', category: 'PASSIVE' },
+  { id: 's9', name: '无影手', category: 'PASSIVE' },{ id: 's10', name: '霸气护体', category: 'PASSIVE' },
+  { id: 's11', name: '大海无量', category: 'PASSIVE' },{ id: 's12', name: '皮糙肉厚', category: 'PASSIVE' },
+  { id: 's13', name: '凌波微步', category: 'PASSIVE' },{ id: 's14', name: '惯用重物', category: 'PASSIVE' },
+  { id: 's15', name: '神来一击', category: 'ACTIVE' },{ id: 's16', name: '装死', category: 'PASSIVE' },
+  { id: 's17', name: '缴械', category: 'ACTIVE' },{ id: 's18', name: '残影', category: 'ACTIVE' },
+  { id: 's19', name: '晴天霹雳', category: 'ACTIVE' },{ id: 's20', name: '龙卷风', category: 'ACTIVE' },
+  { id: 's21', name: '矿泉水', category: 'ACTIVE' },{ id: 's22', name: '胶水', category: 'ACTIVE' },
+  { id: 's23', name: '天使之翼', category: 'ACTIVE' },{ id: 's24', name: '佛山无影脚', category: 'ACTIVE' },
+  { id: 's25', name: '势如暴雨', category: 'ACTIVE' },{ id: 's26', name: '企鹅吼', category: 'ACTIVE' },
+  { id: 's27', name: '企鹅挠痒', category: 'ACTIVE' },{ id: 's28', name: '师傅驾到', category: 'ACTIVE' },
+  { id: 's29', name: '捷波波', category: 'SPECIAL' },{ id: 's30', name: '如来神掌', category: 'SPECIAL' },
+  { id: 's31', name: '避重就轻', category: 'SPECIAL' },{ id: 's32', name: '嗜血', category: 'SPECIAL' },
+];
+
+const DRESSINGS = [
+  { id: 'h1', name: '萌萌兔耳', part: 'HEAD' },{ id: 'h2', name: '海盗眼罩', part: 'HEAD' },
+  { id: 'h3', name: '齐天大圣冠', part: 'HEAD' },{ id: 'h4', name: '博士帽', part: 'HEAD' },
+  { id: 'b1', name: '新手布衣', part: 'BODY' },{ id: 'b2', name: '李小龙紧身衣', part: 'BODY' },
+  { id: 'b3', name: '超人斗篷', part: 'BODY' },{ id: 'b4', name: '熊猫套装', part: 'BODY' },
+  { id: 'ws1', name: '幽灵之火', part: 'WEAPON' },{ id: 'ws2', name: '寒冰气息', part: 'WEAPON' },
+  { id: 'ws3', name: '新手木剑外观', part: 'WEAPON' },
+];
+
+// 工具函数
+function showAlert(el, msg, type) {
+  el.className = `alert alert-${type}`;
+  el.textContent = msg;
+  el.classList.remove("hidden");
+  setTimeout(()=>el.classList.add("hidden"), 2500);
+}
+
+// ✅ 修复1：清空勾选框只针对指定容器，不再全局清空
+function clearAllChecks(containerId) {
+  console.log(`【调试】开始清空【${containerId}】内的勾选框`);
+  // 只清空指定容器内的勾选框
+  const containerCheckboxes = document.querySelectorAll(`#${containerId} input[type="checkbox"]`);
+  console.log(`【调试】${containerId} 下找到 ${containerCheckboxes.length} 个勾选框`);
+  containerCheckboxes.forEach(cb => {
+    cb.checked = false;
+  });
+  console.log(`【调试】清空【${containerId}】勾选框完成`);
+}
+
+// ✅ 修复2：setCheckedItems 只清空当前容器的勾选框，不再全局清空
+function setCheckedItems(containerId, targetIds) {
+  console.log("====================================");
+  console.log("【setCheckedItems】开始执行");
+  console.log("【参数】containerId =", containerId);
+  console.log("【参数】targetIds =", targetIds);
+  
+  // 修复核心：只清空当前容器的勾选框，不是所有！
+  clearAllChecks(containerId);
+  
+  // 校验数据格式：确保是数组且非空
+  if (!Array.isArray(targetIds) || targetIds.length === 0) {
+    console.log("【调试】targetIds不是有效数组，直接返回");
+    return;
+  }
+
+  // 根据容器ID匹配正确的勾选框前缀
+  let prefix = "";
+  if (containerId === "weapon-checks") {
+    prefix = "weapon-";
+    console.log("【调试】匹配到武器前缀：", prefix);
+  } else if (containerId === "skill-checks") {
+    prefix = "skill-";
+    console.log("【调试】匹配到技能前缀：", prefix);
+  } else if (containerId === "dress-checks") {
+    prefix = "dress-";
+    console.log("【调试】匹配到装扮前缀：", prefix);
+  } else {
+    console.log("【错误】未匹配到前缀，containerId =", containerId);
+    return;
+  }
+  
+  // 遍历目标ID，精准匹配勾选框
+  targetIds.forEach((targetId, index) => {
+    console.log(`\n【遍历第${index+1}个ID】targetId =`, targetId);
+    
+    // 跳过空值
+    if (!targetId || targetId.trim() === "") {
+      console.log("【调试】ID为空，跳过");
+      return;
+    }
+    
+    // 拼接勾选框ID
+    const checkboxId = `${prefix}${targetId}`;
+    console.log("【调试】拼接后的勾选框ID =", checkboxId);
+    
+    const checkbox = document.getElementById(checkboxId);
+    console.log("【调试】是否找到勾选框元素：", !!checkbox);
+    
+    if (checkbox) {
+      checkbox.checked = true;
+      console.log("【成功】勾选框已勾选！checked =", checkbox.checked);
+    } else {
+      console.log("【错误】未找到ID为", checkboxId, "的勾选框");
+      // 打印容器内所有勾选框ID，方便排查
+      const allChecks = document.querySelectorAll(`#${containerId} input[type="checkbox"]`);
+      console.log(`【调试】${containerId}下所有勾选框ID：`);
+      allChecks.forEach(cb => console.log(" -", cb.id));
+    }
+  });
+  
+  console.log("====================================");
+}
+
+// 获取勾选的ID列表
+function getCheckedIds(containerId) {
+  const checked = [];
+  document.querySelectorAll(`#${containerId} input[type="checkbox"]:checked`).forEach(cb => {
+    checked.push(cb.value);
+  });
+  return checked;
+}
+
+// 整理装扮为对象
+function getDressingObject() {
+  const selectedIds = getCheckedIds("dress-checks");
+  const dressingObj = { HEAD: "", BODY: "", WEAPON: "" };
+  
+  selectedIds.forEach(id => {
+    const dressing = DRESSINGS.find(d => d.id === id);
+    if (dressing) {
+      dressingObj[dressing.part] = id;
+    }
+  });
+  return dressingObj;
+}
+
+// 渲染勾选框 + 日志
+function renderAllCheckboxes() {
+  console.log("====================================");
+  console.log("【renderAllCheckboxes】开始渲染所有勾选框");
+  
+  // 渲染武器勾选框
+  const weaponContainer = document.getElementById("weapon-checks");
+  weaponContainer.innerHTML = "";
+  const weaponTypes = {
+    LARGE: "大型武器", MEDIUM: "中型武器", SMALL: "小型武器", THROW: "投掷武器"
+  };
+  console.log("【渲染武器】开始渲染武器勾选框");
+  Object.keys(weaponTypes).forEach(type => {
+    const title = document.createElement("div");
+    title.className = "group-title";
+    title.textContent = weaponTypes[type];
+    weaponContainer.appendChild(title);
+    
+    const weapons = WEAPONS.filter(w => w.type === type);
+    console.log(`【渲染武器】${weaponTypes[type]} 下有 ${weapons.length} 个武器`);
+    
+    weapons.forEach(weapon => {
+      const item = document.createElement("div");
+      item.className = "checkbox-item";
+      const checkboxId = `weapon-${weapon.id}`;
+      console.log(`【渲染武器】生成勾选框：ID=${checkboxId}，名称=${weapon.name}`);
+      
+      item.innerHTML = `
+        <input type="checkbox" id="${checkboxId}" value="${weapon.id}">
+        <label for="${checkboxId}">${weapon.id} - ${weapon.name}</label>
+      `;
+      weaponContainer.appendChild(item);
+    });
+  });
+
+  // 渲染技能勾选框
+  const skillContainer = document.getElementById("skill-checks");
+  skillContainer.innerHTML = "";
+  const skillCategories = {
+    BASE_STAT: "基础属性", PASSIVE: "被动技能", ACTIVE: "主动技能", SPECIAL: "特殊技能"
+  };
+  Object.keys(skillCategories).forEach(category => {
+    const title = document.createElement("div");
+    title.className = "group-title";
+    title.textContent = skillCategories[category];
+    skillContainer.appendChild(title);
+    
+    const skills = SKILLS.filter(s => s.category === category);
+    skills.forEach(skill => {
+      const item = document.createElement("div");
+      item.className = "checkbox-item";
+      const checkboxId = `skill-${skill.id}`;
+      item.innerHTML = `
+        <input type="checkbox" id="${checkboxId}" value="${skill.id}">
+        <label for="${checkboxId}">${skill.id} - ${skill.name}</label>
+      `;
+      skillContainer.appendChild(item);
+    });
+  });
+
+  // 渲染装扮勾选框
+  const dressContainer = document.getElementById("dress-checks");
+  dressContainer.innerHTML = "";
+  const dressParts = {
+    HEAD: "头部装扮", BODY: "身体装扮", WEAPON: "武器外观"
+  };
+  Object.keys(dressParts).forEach(part => {
+    const title = document.createElement("div");
+    title.className = "group-title";
+    title.textContent = dressParts[part];
+    dressContainer.appendChild(title);
+    
+    const dressings = DRESSINGS.filter(d => d.part === part);
+    dressings.forEach(dressing => {
+      const item = document.createElement("div");
+      item.className = "checkbox-item";
+      const checkboxId = `dress-${dressing.id}`;
+      item.innerHTML = `
+        <input type="checkbox" id="${checkboxId}" value="${dressing.id}">
+        <label for="${checkboxId}">${dressing.id} - ${dressing.name}</label>
+      `;
+      dressContainer.appendChild(item);
+    });
+  });
+  
+  console.log("【renderAllCheckboxes】所有勾选框渲染完成");
+  console.log("====================================");
+}
+
+// 加载玩家列表
+async function loadPlayerList(keyword = "") {
+  try {
+    const res = await fetch(`${API}/admin/players/all`, {
+      headers: { 
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      }
+    });
+    
+    if (res.status === 401) {
+      showAlert(document.getElementById("login-alert"), "登录已过期，请重新登录", "danger");
+      localStorage.clear();
+      window.location.reload();
+      return;
+    }
+    
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "加载玩家列表失败");
+    
+    const list = data.data || [];
+    const filtered = keyword ? list.filter(p => p.username.includes(keyword)) : list;
+    
+    const container = document.getElementById("player-list");
+    container.innerHTML = "";
+    
+    if (filtered.length === 0) {
+      container.innerHTML = "<div class='text-muted'>暂无玩家数据</div>";
+      return;
+    }
+    
+    filtered.forEach(player => {
+      const btn = document.createElement("button");
+      btn.className = "btn btn-sm btn-outline-primary m-1";
+      btn.textContent = player.username;
+      btn.onclick = () => loadPlayerData(player.username);
+      container.appendChild(btn);
+    });
+  } catch (e) {
+    showAlert(document.getElementById("save-alert"), e.message, "danger");
+    document.getElementById("player-list").innerHTML = `<div class='text-danger'>${e.message}</div>`;
+  }
+}
+
+// 加载单个玩家数据到表单 + 详细日志
+async function loadPlayerData(username) {
+  console.log("====================================");
+  console.log(`【loadPlayerData】开始加载玩家：${username}`);
+  
+  try {
+    const res = await fetch(`${API}/admin/players/all`, {
+      headers: { 
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      }
+    });
+    
+    if (res.status === 401) {
+      showAlert(document.getElementById("login-alert"), "登录已过期，请重新登录", "danger");
+      localStorage.clear();
+      window.location.reload();
+      return;
+    }
+    
+    const data = await res.json();
+    console.log(`【loadPlayerData】获取到所有玩家数据：`, data);
+    
+    if (!res.ok) throw new Error(data.detail || "获取玩家数据失败");
+    
+    const player = data.data.find(p => p.username === username);
+    console.log(`【loadPlayerData】找到目标玩家：`, player);
+    
+    if (!player) {
+      showAlert(document.getElementById("save-alert"), "未找到该玩家", "danger");
+      return;
+    }
+
+    // 填充基础信息
+    document.getElementById("target-user").value = player.username;
+    document.getElementById("edit-level").value = player.level || "";
+    document.getElementById("edit-hp").value = player.maxHp || "";
+    document.getElementById("edit-gold").value = player.gold || "";
+    document.getElementById("edit-win").value = player.win_count || "";
+    document.getElementById("edit-lose").value = player.lose_count || "";
+
+    // ✅ 修复3：依次设置武器/技能/装扮，现在清空只针对各自容器，不会互相影响
+    // 1. 武器回显
+    const playerWeapons = Array.isArray(player.weapons) ? player.weapons : [];
+    console.log(`【loadPlayerData】玩家${username}的武器列表：`, playerWeapons);
+    setCheckedItems("weapon-checks", playerWeapons);
+    
+    // 2. 技能回显
+    const playerSkills = Array.isArray(player.skills) ? player.skills : [];
+    console.log(`【loadPlayerData】玩家${username}的技能列表：`, playerSkills);
+    setCheckedItems("skill-checks", playerSkills);
+    
+    // 3. 装扮回显
+    const dressIds = [];
+    if (player.dressing && typeof player.dressing === "object") {
+      Object.values(player.dressing).forEach(id => {
+        if (id && id.trim() !== "") dressIds.push(id);
+      });
+    }
+    console.log(`【loadPlayerData】玩家${username}的装扮ID列表：`, dressIds);
+    setCheckedItems("dress-checks", dressIds);
+
+    // 友好提示
+    if (playerWeapons.length === 0 && playerSkills.length === 0 && dressIds.length === 0) {
+      showAlert(document.getElementById("save-alert"), "已加载玩家数据（无武器/技能/装扮）", "info");
+    } else {
+      showAlert(document.getElementById("save-alert"), "已加载玩家数据", "success");
+    }
+    
+    // 验证最终勾选状态
+    setTimeout(() => {
+      const checkedWeapons = document.querySelectorAll('#weapon-checks input[type="checkbox"]:checked');
+      console.log(`【验证】最终勾选的武器数量：${checkedWeapons.length}`);
+      checkedWeapons.forEach(cb => {
+        console.log(`【验证】勾选的武器：ID=${cb.id}，value=${cb.value}`);
+      });
+    }, 100);
+    
+  } catch (e) {
+    console.error(`【loadPlayerData】加载玩家${username}失败：`, e);
+    showAlert(document.getElementById("save-alert"), e.message, "danger");
+  }
+  
+  console.log("====================================");
+}
+
+// 保存玩家修改
+async function savePlayerData() {
+  const username = document.getElementById("target-user").value.trim();
+  if (!username) {
+    showAlert(document.getElementById("save-alert"), "请先加载玩家数据", "danger");
+    return;
+  }
+
+  const updateData = {
+    target_username: username,
+    level: document.getElementById("edit-level").value ? parseInt(document.getElementById("edit-level").value) : null,
+    maxHp: document.getElementById("edit-hp").value ? parseInt(document.getElementById("edit-hp").value) : null,
+    gold: document.getElementById("edit-gold").value ? parseInt(document.getElementById("edit-gold").value) : null,
+    win_count: document.getElementById("edit-win").value ? parseInt(document.getElementById("edit-win").value) : null,
+    lose_count: document.getElementById("edit-lose").value ? parseInt(document.getElementById("edit-lose").value) : null,
+    weapons: getCheckedIds("weapon-checks"),
+    skills: getCheckedIds("skill-checks"),
+    dressing: getDressingObject()
+  };
+
+  // 移除空值字段
+  Object.keys(updateData).forEach(key => {
+    if (updateData[key] === null || (Array.isArray(updateData[key]) && updateData[key].length === 0)) {
+      delete updateData[key];
+    }
+  });
+
+  try {
+    const res = await fetch(`${API}/admin/player/batch-update`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(updateData)
+    });
+
+    if (res.status === 401) {
+      showAlert(document.getElementById("login-alert"), "登录已过期，请重新登录", "danger");
+      localStorage.clear();
+      window.location.reload();
+      return;
+    }
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "保存失败");
+
+    showAlert(document.getElementById("save-alert"), "修改成功", "success");
+    loadPlayerList(); // 刷新玩家列表
+  } catch (e) {
+    showAlert(document.getElementById("save-alert"), e.message, "danger");
+  }
+}
+
+// 登录函数
+async function login() {
+  const loginUser = document.getElementById("login-username").value.trim();
+  const loginPwd = document.getElementById("login-password").value.trim();
+  
+  if (!loginUser || !loginPwd) {
+    showAlert(document.getElementById("login-alert"), "请输入用户名和密码", "danger");
+    return;
+  }
+
+  try {
+    const res = await fetch(`${API}/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `username=${encodeURIComponent(loginUser)}&password=${encodeURIComponent(loginPwd)}`
+    });
+    
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "登录失败");
+
+    // 保存登录信息
+    localStorage.setItem("token", data.access_token);
+    localStorage.setItem("role", data.role);
+    localStorage.setItem("username", data.username);
+    
+    token = data.access_token;
+    role = data.role;
+    username = data.username;
+
+    // 切换到管理员面板
+    document.getElementById("login-section").classList.add("hidden");
+    document.getElementById("admin-section").classList.remove("hidden");
+    
+    // 初始化
+    renderAllCheckboxes();
+    loadPlayerList();
+    
+    showAlert(document.getElementById("login-alert"), "登录成功", "success");
+  } catch (e) {
+    showAlert(document.getElementById("login-alert"), e.message, "danger");
+  }
+}
+
+// 退出登录
+function logout() {
+  localStorage.clear();
+  token = null;
+  role = null;
+  username = null;
+  window.location.reload();
+}
+
+// 页面初始化
+window.onload = function() {
+  console.log("【页面初始化】开始执行");
+  
+  // 渲染勾选框
+  renderAllCheckboxes();
+
+  // 检查登录状态
+  if (token && role === "Admin") {
+    document.getElementById("login-section").classList.add("hidden");
+    document.getElementById("admin-section").classList.remove("hidden");
+    loadPlayerList();
+  }
+
+  // 绑定事件
+  document.getElementById("login-btn").addEventListener("click", login);
+  document.getElementById("logout-btn").addEventListener("click", logout);
+  document.getElementById("search-btn").addEventListener("click", () => {
+    const keyword = document.getElementById("search-username").value.trim();
+    loadPlayerList(keyword);
+  });
+  document.getElementById("load-all-btn").addEventListener("click", () => loadPlayerList());
+  document.getElementById("save-btn").addEventListener("click", savePlayerData);
+  
+  console.log("【页面初始化】完成");
+};
+</script>
+</body>
+</html>

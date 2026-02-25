@@ -1,527 +1,361 @@
-from fastapi import APIRouter, HTTPException, Depends, Query, Body
-from pydantic import BaseModel, Field, ConfigDict
-from typing import Optional, List, Dict, Any, Union
-import json
-from passlib.context import CryptContext
-from loguru import logger
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel, Field
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
 import pymysql
-from pymysql import Error
-from datetime import datetime
-import time  # 新增：用于记录耗时
+import json
+import os
+from dotenv import load_dotenv
+from typing import Optional, List, Dict, Any
 
-# ------------------- 基础配置 -------------------
-router = APIRouter(prefix="/api", tags=["乐斗游戏核心接口（终极修复版）"])
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# 加载配置
+load_dotenv()
+app = FastAPI(title="乐斗游戏 - 管理员批量修改版", version="1.0")
 
-# 配置loguru日志格式（增强可读性）
-logger.remove()  # 移除默认配置
-logger.add(
-    sink="qfight_api.log",  # 输出到文件
-    rotation="500 MB",      # 日志文件大小限制
-    retention="7 days",     # 日志保留时间
-    compression="zip",      # 压缩旧日志
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {module}:{function}:{line} | {message}",
-    level="DEBUG"
-)
-# 同时输出到控制台
-logger.add(
-    sink=lambda msg: print(msg, end=""),
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}",
-    level="INFO"
+# CORS（解决前端跨域）
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 内部测试允许所有来源
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# ------------------- 数据库工具函数 -------------------
-def get_db_connection():
-    """每次调用新建独立连接，用完必须关闭"""
-    start_time = time.time()
-    connection = None
-    cursor = None
+# JWT配置
+SECRET_KEY = os.getenv("SECRET_KEY", "test-key-123456")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+# ---------------------- 数据库连接 ----------------------
+def get_db():
+    return pymysql.connect(
+        host=os.getenv("DB_HOST"),
+        port=int(os.getenv("DB_PORT")),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_NAME"),
+        charset="utf8mb4"
+    )
+
+# ---------------------- 核心工具函数 ----------------------
+def create_access_token(data: dict):
+    """生成JWT令牌（包含用户名+角色）"""
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_current_user_info(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
+    """验证令牌，返回当前用户信息（用户名+角色）"""
     try:
-        connection = pymysql.connect(
-            host="localhost",       
-            user="qfight_user",     
-            password="123456",      
-            database="qfight_db",   
-            port=8008,              
-            charset="utf8mb4",
-            cursorclass=pymysql.cursors.DictCursor
-        )
-        cursor = connection.cursor()
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.info(f"✅ [DB] 新建数据库连接成功 | 耗时: {elapsed}ms | 线程ID: {id(connection)}")
-        return connection, cursor
-    except Error as e:
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.error(f"❌ [DB] 创建连接失败 | 耗时: {elapsed}ms | 错误: {str(e)}")
-        if connection:
-            connection.close()
-        raise HTTPException(status_code=500, detail=f"数据库连接失败：{str(e)}")
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        role: str = payload.get("role", "Player")  # Player/Admin
+        if username is None:
+            raise HTTPException(status_code=401, detail="登录失效")
+        return {"username": username, "role": role}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="登录失效，请重新登录")
 
-def close_db_connection(connection, cursor):
-    """安全关闭连接和游标"""
-    start_time = time.time()
-    try:
-        if cursor:
-            cursor.close()
-        if connection and connection.open:
-            connection.close()
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.info(f"🔌 [DB] 连接已关闭 | 耗时: {elapsed}ms | 线程ID: {id(connection) if connection else 'N/A'}")
-    except Error as e:
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.error(f"❌ [DB] 关闭连接失败 | 耗时: {elapsed}ms | 错误: {str(e)}")
+def is_admin(current_user: Dict[str, Any] = Depends(get_current_user_info)) -> bool:
+    """校验是否为管理员"""
+    if current_user["role"] != "Admin":
+        raise HTTPException(status_code=403, detail="仅管理员可调用该接口")
+    return True
 
-def query_user_by_username(username: str):
-    """根据用户名查询用户信息"""
-    start_time = time.time()
-    logger.debug(f"🔍 [DB] 开始查询用户 | 用户名: {username}")
-    connection, cursor = get_db_connection()
-    try:
-        sql = """
-            SELECT ua.id as account_id, ua.username, ua.password, ua.role,
-                p.id as player_id, p.name as player_name, p.role as player_role
-            FROM user_accounts ua
-            LEFT JOIN players p ON ua.id = p.account_id
-            WHERE ua.username = %s
-        """
-        cursor.execute(sql, (username,))
-        user_data = cursor.fetchone()
-        
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        if user_data:
-            logger.info(f"✅ [DB] 查询用户成功 | 用户名: {username} | account_id: {user_data.get('account_id')} | 耗时: {elapsed}ms")
-            # 脱敏日志（隐藏密码）
-            safe_user_data = {k: v for k, v in user_data.items() if k != 'password'}
-            logger.debug(f"📝 [DB] 用户详情: {json.dumps(safe_user_data, ensure_ascii=False)}")
-        else:
-            logger.warning(f"⚠️ [DB] 查询用户失败 | 用户名: {username} | 原因: 用户不存在 | 耗时: {elapsed}ms")
-        
-        return user_data
-    finally:
-        close_db_connection(connection, cursor)
+def get_player_id(username: str) -> int:
+    """通过用户名获取玩家ID"""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT p.id FROM players p
+        JOIN user_accounts u ON p.account_id = u.id
+        WHERE u.username = %s
+    """, (username,))
+    res = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if not res:
+        raise HTTPException(404, f"玩家 {username} 不存在")
+    return res[0]
 
-def query_user_by_account_id(account_id: int):
-    """根据账号ID查询用户信息"""
-    start_time = time.time()
-    logger.debug(f"🔍 [DB] 开始查询用户 | account_id: {account_id}")
-    connection, cursor = get_db_connection()
-    try:
-        sql = """
-            SELECT ua.id as account_id, ua.username, ua.password, ua.role,
-                p.id as player_id, p.name as player_name, p.role as player_role
-            FROM user_accounts ua
-            LEFT JOIN players p ON ua.id = p.account_id
-            WHERE ua.id = %s
-        """
-        cursor.execute(sql, (account_id,))
-        user_data = cursor.fetchone()
-        
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        if user_data:
-            logger.info(f"✅ [DB] 查询用户成功 | account_id: {account_id} | 用户名: {user_data.get('username')} | 耗时: {elapsed}ms")
-            # 脱敏日志
-            safe_user_data = {k: v for k, v in user_data.items() if k != 'password'}
-            logger.debug(f"📝 [DB] 用户详情: {json.dumps(safe_user_data, ensure_ascii=False)}")
-        else:
-            logger.warning(f"⚠️ [DB] 查询用户失败 | account_id: {account_id} | 原因: 用户不存在 | 耗时: {elapsed}ms")
-        
-        return user_data
-    finally:
-        close_db_connection(connection, cursor)
+# ---------------------- 请求模型 ----------------------
+class UserCreate(BaseModel):
+    username: str = Field(..., min_length=3)
+    password: str = Field(..., min_length=6)
+    role: str = Field("Player", pattern="^(Player|Admin)$")  # 注册时可指定角色
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """验证密码（日志增强）"""
-    # 注意：不在日志中记录密码相关信息！
-    result = plain_password == hashed_password
-    logger.debug(f"🔐 [AUTH] 密码验证 | 结果: {'成功' if result else '失败'}")
-    return result
+class PasswordChange(BaseModel):
+    old_password: str
+    new_password: str = Field(..., min_length=6)
 
-# ------------------- 数据模型 -------------------
-class UserLoginRequest(BaseModel):
-    username: str
-    password: str
-
-class UserRegisterRequest(BaseModel):
-    username: str
-    password: str
-    player_name: str = "乐斗小豆"
-    role: str = "Player"
-
-class PlayerUpdateRequest(BaseModel):
-    account_id: int
-    name: Optional[str] = None
-    level: Optional[int] = None
-    exp: Optional[int] = None
-    gold: Optional[int] = None
-    str: Optional[int] = None
-    agi: Optional[int] = None
-    spd: Optional[int] = None
-    maxHp: Optional[int] = None
+# 普通玩家修改自己的模型（单字段/分批）
+class PlayerSelfUpdate(BaseModel):
+    add_level: int = Field(0, ge=0)
+    add_maxHp: int = Field(0, ge=0)
+    add_gold: int = Field(0, ge=0)
+    add_win: int = Field(0, ge=0)
+    add_lose: int = Field(0, ge=0)
     weapons: Optional[List[str]] = None
     skills: Optional[List[str]] = None
     dressing: Optional[Dict[str, str]] = None
-    unlockedDressings: Optional[List[str]] = None
-    isConcentrated: Optional[bool] = None
-    friends: Optional[List[Dict[str, Any]]] = None
 
-class UserAuthRequest(BaseModel):
-    account_id: Optional[int] = None
-    username: Optional[str] = None
+# 管理员批量修改任意玩家的模型（一次性传所有属性）
+class AdminBatchUpdate(BaseModel):
+    target_username: str = Field(..., description="要修改的目标玩家用户名")
+    level: Optional[int] = Field(None, ge=1)  # 直接设置等级（非增量）
+    maxHp: Optional[int] = Field(None, ge=1)  # 直接设置血量
+    gold: Optional[int] = Field(None, ge=0)   # 直接设置金币
+    win_count: Optional[int] = Field(None, ge=0)  # 直接设置胜场
+    lose_count: Optional[int] = Field(None, ge=0) # 直接设置负场
+    weapons: Optional[List[str]] = None       # 直接覆盖武器列表
+    skills: Optional[List[str]] = None        # 直接覆盖技能列表
+    dressing: Optional[Dict[str, str]] = None # 直接覆盖装扮
 
-# ------------------- 核心依赖 -------------------
-def get_current_user(
-    account_id: Optional[int] = Body(default=None),
-    username: Optional[str] = Body(default=None),
-    auth_req: Optional[UserAuthRequest] = Body(default=None)
-):
-    """兼容前端 Body 传参的权限校验（日志增强）"""
-    start_time = time.time()
-    final_account_id = account_id or (auth_req.account_id if auth_req else None)
-    final_username = username or (auth_req.username if auth_req else None)
-    
-    logger.debug(f"🔍 [AUTH] 开始权限校验 | account_id: {final_account_id} | username: {final_username}")
-    
-    if not final_account_id and not final_username:
-        logger.error(f"❌ [AUTH] 权限校验失败 | 原因: 缺少account_id和username | 耗时: {round((time.time() - start_time)*1000,2)}ms")
-        raise HTTPException(status_code=400, detail="必须传递account_id或username")
-    
+# ---------------------- 1. 基础接口（注册/登录/改密码） ----------------------
+@app.post("/register", summary="用户注册（可指定角色）")
+def register(user: UserCreate):
+    conn = get_db()
+    cursor = conn.cursor()
+    # 检查用户名是否存在
+    cursor.execute("SELECT id FROM user_accounts WHERE username=%s", (user.username,))
+    if cursor.fetchone():
+        raise HTTPException(400, "用户名已存在")
+
     try:
-        if final_account_id:
-            user = query_user_by_account_id(final_account_id)
-        else:
-            user = query_user_by_username(final_username)
-        
-        if not user:
-            logger.warning(f"⚠️ [AUTH] 权限校验失败 | account_id: {final_account_id} | username: {final_username} | 原因: 用户不存在 | 耗时: {round((time.time() - start_time)*1000,2)}ms")
-            raise HTTPException(status_code=401, detail="用户不存在")
-        
-        user["role"] = user["role"].upper() if user.get("role") else "PLAYER"
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.info(f"✅ [AUTH] 权限校验成功 | account_id: {user['account_id']} | 用户名: {user['username']} | 角色: {user['role']} | 耗时: {elapsed}ms")
-        
-        return user
-    except Exception as e:
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.error(f"❌ [AUTH] 权限校验异常 | account_id: {final_account_id} | username: {final_username} | 错误: {str(e)} | 耗时: {elapsed}ms")
-        raise
+        # 插入用户（明文密码，内部测试用）
+        cursor.execute(
+            "INSERT INTO user_accounts (username, password, role) VALUES (%s,%s,%s)",
+            (user.username, user.password, user.role)
+        )
+        uid = cursor.lastrowid
 
-def is_admin(current_user: dict = Depends(get_current_user)):
-    """管理员权限校验（日志增强）"""
-    start_time = time.time()
-    logger.debug(f"🔍 [AUTH] 开始管理员权限校验 | account_id: {current_user['account_id']} | 当前角色: {current_user.get('role')}")
-    
-    if current_user.get("role", "").upper() != "ADMIN":
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.warning(f"⚠️ [AUTH] 管理员权限校验失败 | account_id: {current_user['account_id']} | 当前角色: {current_user.get('role')} | 耗时: {elapsed}ms")
-        raise HTTPException(status_code=403, detail="仅管理员可操作")
-    
-    elapsed = round((time.time() - start_time) * 1000, 2)
-    logger.info(f"✅ [AUTH] 管理员权限校验成功 | account_id: {current_user['account_id']} | 耗时: {elapsed}ms")
-    return current_user
-
-# ------------------- 核心接口 -------------------
-
-@router.post("/auth/login")
-async def login_user(req: UserLoginRequest):
-    """用户登录接口（日志增强）"""
-    start_time = time.time()
-    logger.info(f"📥 [API] 收到登录请求 | 用户名: {req.username} | 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    connection, cursor = get_db_connection()
-    try:
+        # 初始化玩家数据
+        init_weapons = json.dumps([])
+        init_skills = json.dumps([])
+        init_dressing = json.dumps({"HEAD": "", "BODY": "", "WEAPON": ""})
         cursor.execute("""
-            SELECT ua.id as account_id, ua.username, ua.password, ua.role,
-                p.id as player_id, p.name as player_name
-            FROM user_accounts ua
-            LEFT JOIN players p ON ua.id = p.account_id
-            WHERE ua.username = %s
-        """, (req.username,))
-        user = cursor.fetchone()
-        
-        if not user or not verify_password(req.password, user["password"]):
-            elapsed = round((time.time() - start_time) * 1000, 2)
-            logger.warning(f"❌ [API] 登录失败 | 用户名: {req.username} | 原因: 账号或密码错误 | 耗时: {elapsed}ms")
-            raise HTTPException(status_code=401, detail="账号或密码错误")
-        
-        user["role"] = user["role"].upper()
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.success(f"✅ [API] 登录成功 | account_id: {user['account_id']} | 用户名: {req.username} | 角色: {user['role']} | 耗时: {elapsed}ms")
-        
-        return {
-            "success": True,
-            "data": {
-                "account_id": user["account_id"],
-                "username": user["username"],
-                "player_id": user["player_id"],
-                "player_name": user["player_name"],
-                "role": user["role"]
-            }
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.error(f"❌ [API] 登录异常 | 用户名: {req.username} | 错误: {str(e)} | 耗时: {elapsed}ms", exc_info=True)
-        raise HTTPException(status_code=500, detail="服务器内部错误")
-    finally:
-        close_db_connection(connection, cursor)
+            INSERT INTO players (account_id, name, level, exp, gold, str, agi, spd, maxHp,
+                win_count, lose_count, weapons, skills, dressing, role)
+            VALUES (%s,%s,1,0,500,5,5,5,300,0,0,%s,%s,%s,%s)
+        """, (uid, user.username, init_weapons, init_skills, init_dressing, user.role))
 
-@router.post("/auth/register")
-async def register_user(req: UserRegisterRequest):
-    """用户注册接口（日志增强）"""
-    start_time = time.time()
-    logger.info(f"📥 [API] 收到注册请求 | 用户名: {req.username} | 角色: {req.role} | 角色名: {req.player_name}")
-    
-    connection, cursor = get_db_connection()
-    try:
-        if req.role.upper() == "ADMIN":
-            elapsed = round((time.time() - start_time) * 1000, 2)
-            logger.warning(f"⚠️ [API] 注册失败 | 用户名: {req.username} | 原因: 禁止注册管理员账号 | 耗时: {elapsed}ms")
-            raise HTTPException(status_code=403, detail="禁止直接注册管理员账号")
-        
-        # 检查用户名是否存在
-        cursor.execute("SELECT id FROM user_accounts WHERE username = %s", (req.username,))
-        if cursor.fetchone():
-            elapsed = round((time.time() - start_time) * 1000, 2)
-            logger.warning(f"⚠️ [API] 注册失败 | 用户名: {req.username} | 原因: 账号已存在 | 耗时: {elapsed}ms")
-            raise HTTPException(status_code=400, detail="账号已存在")
-        
-        # 创建账号
-        user_role = req.role.upper()
-        cursor.execute("""
-            INSERT INTO user_accounts (username, password, created_at, role, updated_at)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (req.username, req.password, datetime.now(), user_role, datetime.now()))
-        account_id = cursor.lastrowid
-        logger.debug(f"📝 [DB] 创建账号成功 | account_id: {account_id} | 用户名: {req.username}")
-        
-        # 创建玩家数据
-        cursor.execute("""
-            INSERT INTO players (
-                name, level, exp, gold, str, agi, spd, maxHp,
-                weapons, skills, dressing, unlockedDressings, isConcentrated, friends, account_id, role
-            ) VALUES (
-                %s, 1, 0, 500, 5, 5, 5, 300,
-                '[]', '[]', '{"HEAD":"","BODY":"","WEAPON":""}', '[]', 0, '[]', %s, %s
-            )
-        """, (req.player_name, account_id, user_role))
-        logger.debug(f"📝 [DB] 创建玩家数据成功 | account_id: {account_id} | 角色名: {req.player_name}")
-        
-        connection.commit()
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.success(f"✅ [API] 注册成功 | account_id: {account_id} | 用户名: {req.username} | 耗时: {elapsed}ms")
-        
-        return {"success": True, "message": "注册成功", "data": {"account_id": account_id}}
-    except HTTPException:
-        raise
-    except Error as e:
-        connection.rollback()
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.error(f"❌ [API] 注册数据库异常 | 用户名: {req.username} | 错误: {str(e)} | 耗时: {elapsed}ms", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        conn.commit()
+        return {"code": 200, "msg": f"注册成功！角色：{user.role}", "username": user.username}
     except Exception as e:
-        connection.rollback()
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.error(f"❌ [API] 注册未知异常 | 用户名: {req.username} | 错误: {str(e)} | 耗时: {elapsed}ms", exc_info=True)
-        raise HTTPException(status_code=500, detail="服务器内部错误")
+        conn.rollback()
+        raise HTTPException(500, f"注册失败：{str(e)}")
     finally:
-        close_db_connection(connection, cursor)
+        cursor.close()
+        conn.close()
 
-@router.post("/player/list")
-async def get_all_server_players(current_user: dict = Depends(get_current_user)):
-    """获取服务器玩家列表（日志增强）"""
-    start_time = time.time()
-    logger.info(f"📥 [API] 收到获取玩家列表请求 | 操作人: {current_user['account_id']} | 角色: {current_user['role']}")
-    
-    connection, cursor = get_db_connection()
-    try:
-        if current_user.get("role") == "ADMIN":
-            cursor.execute("SELECT p.*, ua.role as user_role FROM players p JOIN user_accounts ua ON p.account_id = ua.id")
-            logger.debug(f"📝 [DB] 管理员查询所有玩家 | 操作人: {current_user['account_id']}")
-        else:
-            cursor.execute("SELECT p.*, ua.role as user_role FROM players p JOIN user_accounts ua ON p.account_id = ua.id WHERE ua.role = 'PLAYER' AND p.account_id != %s", (current_user["account_id"],))
-            logger.debug(f"📝 [DB] 普通玩家查询其他玩家 | 操作人: {current_user['account_id']}")
-        
-        players = cursor.fetchall()
-        # 处理JSON字段
-        for p in players:
-            for f in ["weapons", "skills", "dressing", "unlockedDressings", "friends"]:
-                p[f] = json.loads(p[f]) if p[f] else ([] if f != "dressing" else {})
-            p["isConcentrated"] = bool(p["isConcentrated"])
-            p["user_role"] = p["user_role"].upper()
-        
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.info(f"✅ [API] 获取玩家列表成功 | 操作人: {current_user['account_id']} | 玩家数量: {len(players)} | 耗时: {elapsed}ms")
-        logger.debug(f"📝 [API] 玩家列表详情: {json.dumps(players, ensure_ascii=False, default=str)[:500]}...")  # 截断长日志
-        
-        return {"success": True, "data": players}
-    except Exception as e:
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.error(f"❌ [API] 获取玩家列表异常 | 操作人: {current_user['account_id']} | 错误: {str(e)} | 耗时: {elapsed}ms", exc_info=True)
-        raise HTTPException(status_code=500, detail="获取玩家列表失败")
-    finally:
-        close_db_connection(connection, cursor)
+@app.post("/login", summary="用户登录")
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """登录返回令牌+角色，用于后续权限判断"""
+    conn = get_db()
+    cursor = conn.cursor(pymysql.cursors.DictCursor)
+    cursor.execute(
+        "SELECT username, role FROM user_accounts WHERE username=%s AND password=%s",
+        (form_data.username, form_data.password)
+    )
+    user = cursor.fetchone()
+    cursor.close()
+    conn.close()
 
-# --- 重点修改接口 1: GET 改为 POST，Query 改为 Body ---
-@router.post("/player/data")
-async def get_player_data(
-    account_id: int = Body(..., embed=True), 
-    current_user: dict = Depends(get_current_user)
-):
-    """获取玩家数据（日志增强）"""
-    start_time = time.time()
-    logger.info(f"📥 [API] 收到获取玩家数据请求 | 目标ID: {account_id} | 操作人: {current_user['account_id']} | 操作人角色: {current_user['role']}")
+    if not user:
+        raise HTTPException(401, "账号或密码错误")
     
-    # 权限校验
-    if current_user.get("role") != "ADMIN" and current_user["account_id"] != account_id:
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.warning(f"⚠️ [API] 获取玩家数据失败 | 目标ID: {account_id} | 操作人: {current_user['account_id']} | 原因: 无权查看他人数据 | 耗时: {elapsed}ms")
-        raise HTTPException(status_code=403, detail="无权查看他人数据")
-    
-    connection, cursor = get_db_connection()
-    try:
-        cursor.execute("SELECT * FROM players WHERE account_id = %s", (account_id,))
-        player = cursor.fetchone()
-        
-        if not player:
-            elapsed = round((time.time() - start_time) * 1000, 2)
-            logger.warning(f"⚠️ [API] 获取玩家数据失败 | 目标ID: {account_id} | 原因: 玩家不存在 | 耗时: {elapsed}ms")
-            raise HTTPException(status_code=404, detail="玩家不存在")
-        
-        # 处理JSON字段
-        for f in ["weapons", "skills", "dressing", "unlockedDressings", "friends"]:
-            player[f] = json.loads(player[f]) if player[f] else ([] if f != "dressing" else {})
-        player["isConcentrated"] = bool(player["isConcentrated"])
-        
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.info(f"✅ [API] 获取玩家数据成功 | 目标ID: {account_id} | 操作人: {current_user['account_id']} | 耗时: {elapsed}ms")
-        logger.debug(f"📝 [API] 玩家数据详情: {json.dumps(player, ensure_ascii=False, default=str)}")
-        
-        return {"success": True, "data": player}
-    except HTTPException:
-        raise
-    except Exception as e:
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.error(f"❌ [API] 获取玩家数据异常 | 目标ID: {account_id} | 操作人: {current_user['account_id']} | 错误: {str(e)} | 耗时: {elapsed}ms", exc_info=True)
-        raise HTTPException(status_code=500, detail="获取玩家数据失败")
-    finally:
-        close_db_connection(connection, cursor)
+    # 令牌中携带角色信息
+    access_token = create_access_token(data={"sub": user["username"], "role": user["role"]})
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "username": user["username"],
+        "role": user["role"]
+    }
 
-@router.put("/player/update")
-async def update_player_data(req: PlayerUpdateRequest, current_user: dict = Depends(get_current_user)):
-    """更新玩家数据（日志增强）"""
-    start_time = time.time()
-    logger.info(f"📥 [API] 收到更新玩家数据请求 | 目标ID: {req.account_id} | 操作人: {current_user['account_id']} | 操作人角色: {current_user['role']}")
+@app.post("/change-password", summary="修改自己的密码")
+def change_pwd(data: PasswordChange, current_user: Dict[str, Any] = Depends(get_current_user_info)):
+    conn = get_db()
+    cursor = conn.cursor(pymysql.cursors.DictCursor)
+    cursor.execute("SELECT password FROM user_accounts WHERE username=%s", (current_user["username"],))
+    user = cursor.fetchone()
     
-    # 权限校验
-    if current_user.get("role") != "ADMIN" and current_user["account_id"] != req.account_id:
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.warning(f"⚠️ [API] 更新玩家数据失败 | 目标ID: {req.account_id} | 操作人: {current_user['account_id']} | 原因: 无权更新他人数据 | 耗时: {elapsed}ms")
-        raise HTTPException(status_code=403, detail="无权更新他人数据")
+    if not user or user["password"] != data.old_password:
+        raise HTTPException(400, "旧密码错误")
+
+    cursor.execute(
+        "UPDATE user_accounts SET password=%s WHERE username=%s",
+        (data.new_password, current_user["username"])
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return {"code": 200, "msg": "密码修改成功"}
+
+# ---------------------- 2. 普通玩家接口（仅改自己，分批/单字段） ----------------------
+@app.get("/player/self", summary="查看自己的信息")
+def get_self_info(current_user: Dict[str, Any] = Depends(get_current_user_info)):
+    """普通玩家查看自己的完整数据"""
+    username = current_user["username"]
+    conn = get_db()
+    cursor = conn.cursor(pymysql.cursors.DictCursor)
+    cursor.execute("""
+        SELECT u.username, p.level, p.maxHp, p.gold, p.win_count, p.lose_count,
+               p.weapons, p.skills, p.dressing
+        FROM players p
+        JOIN user_accounts u ON p.account_id = u.id
+        WHERE u.username = %s
+    """, (username,))
+    player = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if not player:
+        raise HTTPException(404, "玩家信息不存在")
     
-    # 记录要更新的字段
-    update_fields_list = [f for f, v in req.model_dump(exclude={"account_id"}).items() if v is not None]
-    logger.debug(f"📝 [API] 准备更新字段 | 目标ID: {req.account_id} | 字段列表: {update_fields_list}")
-    logger.debug(f"📝 [API] 更新数据详情: {json.dumps(req.model_dump(), ensure_ascii=False, default=str)}")
-    
-    connection, cursor = get_db_connection()
+    # 解析JSON字段
+    player["weapons"] = json.loads(player["weapons"]) if player["weapons"] else []
+    player["skills"] = json.loads(player["skills"]) if player["skills"] else []
+    player["dressing"] = json.loads(player["dressing"]) if player["dressing"] else {}
+    return {"code": 200, "data": player}
+
+@app.post("/player/self/update", summary="普通玩家修改自己的信息（分批）")
+def update_self_info(data: PlayerSelfUpdate, current_user: Dict[str, Any] = Depends(get_current_user_info)):
+    """普通玩家只能增量修改自己的属性，或覆盖武器/技能/装扮"""
+    username = current_user["username"]
+    pid = get_player_id(username)
+    conn = get_db()
+    cursor = conn.cursor()
+
     try:
-        update_fields = []
-        params = []
-        for f, v in req.model_dump(exclude={"account_id"}).items():
-            if v is not None:
-                update_fields.append(f"{f} = %s")
-                # 处理JSON字段和布尔值
-                params.append(json.dumps(v) if isinstance(v, (list, dict)) else (1 if isinstance(v, bool) and v else (0 if isinstance(v, bool) else v)))
+        # 1. 增量修改数值属性（等级/血量/金币/胜负）
+        update_sql = []
+        update_params = []
+        if data.add_level > 0:
+            update_sql.append("level = level + %s")
+            update_params.append(data.add_level)
+            update_sql.append("maxHp = maxHp + %s")  # 升级同步加血量
+            update_params.append(data.add_level * 50)
+        if data.add_maxHp > 0:
+            update_sql.append("maxHp = maxHp + %s")
+            update_params.append(data.add_maxHp)
+        if data.add_gold > 0:
+            update_sql.append("gold = gold + %s")
+            update_params.append(data.add_gold)
+        if data.add_win > 0:
+            update_sql.append("win_count = win_count + %s")
+            update_params.append(data.add_win)
+        if data.add_lose > 0:
+            update_sql.append("lose_count = lose_count + %s")
+            update_params.append(data.add_lose)
         
-        if not update_fields:
-            elapsed = round((time.time() - start_time) * 1000, 2)
-            logger.info(f"ℹ️ [API] 更新玩家数据跳过 | 目标ID: {req.account_id} | 原因: 无更新字段 | 耗时: {elapsed}ms")
-            return {"success": True}
+        # 2. 覆盖修改JSON属性（武器/技能/装扮）
+        if data.weapons is not None:
+            update_sql.append("weapons = %s")
+            update_params.append(json.dumps(data.weapons))
+        if data.skills is not None:
+            update_sql.append("skills = %s")
+            update_params.append(json.dumps(data.skills))
+        if data.dressing is not None:
+            update_sql.append("dressing = %s")
+            update_params.append(json.dumps(data.dressing))
         
         # 执行更新
-        params.append(req.account_id)
-        sql = f"UPDATE players SET {', '.join(update_fields)} WHERE account_id = %s"
-        cursor.execute(sql, params)
-        affected_rows = cursor.rowcount
-        connection.commit()
+        if update_sql:
+            sql = f"UPDATE players SET {', '.join(update_sql)} WHERE id = %s"
+            update_params.append(pid)
+            cursor.execute(sql, tuple(update_params))
+            conn.commit()
         
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.success(f"✅ [API] 更新玩家数据成功 | 目标ID: {req.account_id} | 影响行数: {affected_rows} | 更新字段数: {len(update_fields)} | 耗时: {elapsed}ms")
-        
-        return {"success": True}
+        return {"code": 200, "msg": "个人信息修改成功"}
     except Exception as e:
-        connection.rollback()
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.error(f"❌ [API] 更新玩家数据异常 | 目标ID: {req.account_id} | 错误: {str(e)} | 耗时: {elapsed}ms", exc_info=True)
-        raise HTTPException(status_code=500, detail="更新玩家数据失败")
+        conn.rollback()
+        raise HTTPException(500, f"修改失败：{str(e)}")
     finally:
-        close_db_connection(connection, cursor)
+        cursor.close()
+        conn.close()
 
-@router.post("/player/all")
-async def get_all_players_admin(current_user: dict = Depends(is_admin)):
-    """管理员获取所有玩家（日志增强）"""
-    start_time = time.time()
-    logger.info(f"📥 [API] 管理员获取所有玩家 | 操作人: {current_user['account_id']}")
-    
-    try:
-        result = await get_all_server_players(current_user)
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.success(f"✅ [API] 管理员获取所有玩家成功 | 操作人: {current_user['account_id']} | 耗时: {elapsed}ms")
-        return result
-    except Exception as e:
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.error(f"❌ [API] 管理员获取所有玩家异常 | 操作人: {current_user['account_id']} | 错误: {str(e)} | 耗时: {elapsed}ms", exc_info=True)
-        raise
+# ---------------------- 3. 管理员专属接口（批量修改任意玩家） ----------------------
+@app.get("/admin/players/all", summary="管理员查看所有玩家")
+def admin_get_all_players(_=Depends(is_admin)):
+    """管理员查看全服所有玩家完整数据"""
+    conn = get_db()
+    cursor = conn.cursor(pymysql.cursors.DictCursor)
+    cursor.execute("""
+        SELECT u.username, p.level, p.maxHp, p.gold, p.win_count, p.lose_count,
+               p.weapons, p.skills, p.dressing
+        FROM players p
+        JOIN user_accounts u ON p.account_id = u.id
+        ORDER BY p.level DESC, p.win_count DESC
+    """)
+    players = cursor.fetchall()
+    cursor.close()
+    conn.close()
 
-# --- 重点修改接口 2: Query 改为 Body ---
-@router.post("/player/reset")
-async def reset_player_data(
-    account_id: int = Body(..., embed=True), 
-    current_user: dict = Depends(get_current_user)
-):
-    """重置玩家数据（日志增强）"""
-    start_time = time.time()
-    logger.info(f"📥 [API] 收到重置玩家数据请求 | 目标ID: {account_id} | 操作人: {current_user['account_id']} | 操作人角色: {current_user['role']}")
-    
-    # 权限校验
-    if current_user.get("role") != "ADMIN" and current_user["account_id"] != account_id:
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.warning(f"⚠️ [API] 重置玩家数据失败 | 目标ID: {account_id} | 操作人: {current_user['account_id']} | 原因: 无权重置他人数据 | 耗时: {elapsed}ms")
-        raise HTTPException(status_code=403, detail="无权重置他人数据")
-    
-    connection, cursor = get_db_connection()
+    # 解析JSON字段
+    for p in players:
+        p["weapons"] = json.loads(p["weapons"]) if p["weapons"] else []
+        p["skills"] = json.loads(p["skills"]) if p["skills"] else []
+        p["dressing"] = json.loads(p["dressing"]) if p["dressing"] else {}
+    return {"code": 200, "data": players}
+
+@app.post("/admin/player/batch-update", summary="管理员批量修改任意玩家")
+def admin_batch_update(data: AdminBatchUpdate, _=Depends(is_admin)):
+    """管理员一次性修改目标玩家的所有属性（直接设置值，非增量）"""
+    target_username = data.target_username
+    pid = get_player_id(target_username)
+    conn = get_db()
+    cursor = conn.cursor()
+
     try:
-        # 执行重置
-        cursor.execute("""
-            UPDATE players SET level=1, exp=0, gold=500, str=5, agi=5, spd=5, maxHp=300,
-            weapons='[]', skills='[]', dressing='{"HEAD":"","BODY":"","WEAPON":""}',
-            unlockedDressings='[]', isConcentrated=0, friends='[]'
-            WHERE account_id = %s
-        """, (account_id,))
-        affected_rows = cursor.rowcount
-        connection.commit()
+        # 收集要修改的字段和值（仅修改非None的字段）
+        update_sql = []
+        update_params = []
+        if data.level is not None:
+            update_sql.append("level = %s")
+            update_params.append(data.level)
+        if data.maxHp is not None:
+            update_sql.append("maxHp = %s")
+            update_params.append(data.maxHp)
+        if data.gold is not None:
+            update_sql.append("gold = %s")
+            update_params.append(data.gold)
+        if data.win_count is not None:
+            update_sql.append("win_count = %s")
+            update_params.append(data.win_count)
+        if data.lose_count is not None:
+            update_sql.append("lose_count = %s")
+            update_params.append(data.lose_count)
+        if data.weapons is not None:
+            update_sql.append("weapons = %s")
+            update_params.append(json.dumps(data.weapons))
+        if data.skills is not None:
+            update_sql.append("skills = %s")
+            update_params.append(json.dumps(data.skills))
+        if data.dressing is not None:
+            update_sql.append("dressing = %s")
+            update_params.append(json.dumps(data.dressing))
         
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        if affected_rows > 0:
-            logger.success(f"✅ [API] 重置玩家数据成功 | 目标ID: {account_id} | 操作人: {current_user['account_id']} | 影响行数: {affected_rows} | 耗时: {elapsed}ms")
-            return {"success": True, "message": "重置成功"}
-        else:
-            logger.warning(f"⚠️ [API] 重置玩家数据无变化 | 目标ID: {account_id} | 操作人: {current_user['account_id']} | 耗时: {elapsed}ms")
-            return {"success": True, "message": "玩家数据无变化（可能不存在）"}
+        # 执行批量更新
+        if update_sql:
+            sql = f"UPDATE players SET {', '.join(update_sql)} WHERE id = %s"
+            update_params.append(pid)
+            cursor.execute(sql, tuple(update_params))
+            conn.commit()
+        
+        return {"code": 200, "msg": f"玩家 {target_username} 数据批量修改成功"}
     except Exception as e:
-        connection.rollback()
-        elapsed = round((time.time() - start_time) * 1000, 2)
-        logger.error(f"❌ [API] 重置玩家数据异常 | 目标ID: {account_id} | 操作人: {current_user['account_id']} | 错误: {str(e)} | 耗时: {elapsed}ms", exc_info=True)
-        raise HTTPException(status_code=500, detail="重置玩家数据失败")
+        conn.rollback()
+        raise HTTPException(500, f"批量修改失败：{str(e)}")
     finally:
-        close_db_connection(connection, cursor)
+        cursor.close()
+        conn.close()
 
+# ---------------------- 启动服务 ----------------------
 if __name__ == "__main__":
-    from fastapi import FastAPI
     import uvicorn
-    app = FastAPI(title="乐斗游戏API", description="乐斗游戏后端API（增强日志版）", version="1.0.0")
-    app.include_router(router)
-    
-    logger.info("🚀 启动乐斗游戏API服务器 | 地址: 0.0.0.0:8009")
-    uvicorn.run(app, host="0.0.0.0", port=8009) 帮我写一个脚本脱离命令行之后还能继续使用
+    uvicorn.run(app, host="0.0.0.0", port=8000)
